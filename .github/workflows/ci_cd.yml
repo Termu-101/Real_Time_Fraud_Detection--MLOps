@@ -1,0 +1,186 @@
+# This file defines the CI/CD pipeline.
+# GitHub reads every file in .github/workflows/ automatically.
+# The name appears in the GitHub Actions tab in your repo.
+name: Fraud MLOps CI/CD
+
+# on: defines what events trigger this workflow.
+# push to main triggers the full pipeline — tests + build + push.
+# pull_request triggers only the tests — so you catch errors before merging.
+# This means every PR gets tested automatically before anyone reviews it.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+# env: defines environment variables available to every job in this workflow.
+# We reference GitHub secrets using ${{ secrets.NAME }} syntax.
+# Secrets are encrypted — no one can read them, not even you, after setting them.
+env:
+  AWS_REGION:     ${{ secrets.AWS_DEFAULT_REGION }}
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  ECR_PRODUCER:   fraud-mlops/producer
+  ECR_CONSUMER:   fraud-mlops/consumer
+
+# jobs: the actual work the pipeline does.
+# Jobs run in parallel by default. We have two — test and build.
+# build depends on test so it only runs if tests pass.
+jobs:
+
+  # ── Job 1: Run tests ────────────────────────────────────────────────────────
+  # This job runs on every push and every pull request.
+  # It installs your dependencies and runs pytest.
+  # If any test fails, this job fails and the build job never starts.
+  test:
+    name: Run tests
+    # runs-on defines what machine GitHub uses to run this job.
+    # ubuntu-latest is a free Linux VM provided by GitHub.
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: checkout your code onto the GitHub runner machine.
+      # Without this step the runner has no files to work with.
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 2: install Python 3.11 on the runner.
+      # uses: references a pre-built Action from the GitHub marketplace.
+      # actions/setup-python handles installing Python cleanly.
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      # Step 3: cache pip packages so subsequent runs are faster.
+      # The cache key includes a hash of requirements.txt — if requirements
+      # change, the cache is invalidated and packages are reinstalled fresh.
+      # If requirements have not changed, packages are loaded from cache
+      # in seconds instead of being downloaded again.
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # Step 4: install all project dependencies.
+      # We install the packages needed for tests — not Airflow, which
+      # runs in Docker and does not need to be installed on the runner.
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install \
+            pandas \
+            numpy \
+            scikit-learn \
+            boto3 \
+            python-dotenv \
+            pytest \
+            joblib \
+            kafka-python \
+            websocket-client
+
+      # Step 5: run all tests in the tests/ folder.
+      # -v means verbose — show each test name and its result.
+      # --tb=short shows a short traceback on failure instead of the full one.
+      # The exit code of pytest is non-zero if any test fails,
+      # which causes this step to fail, which causes the job to fail.
+      - name: Run tests
+        run: |
+          pytest tests/ -v --tb=short
+        env:
+          # Set dummy AWS credentials for tests that use boto3.
+          # Real credentials are not needed because tests mock AWS calls.
+          # Without these, boto3 throws a NoCredentialsError even in tests.
+          AWS_ACCESS_KEY_ID: dummy
+          AWS_SECRET_ACCESS_KEY: dummy
+          AWS_DEFAULT_REGION: us-east-1
+          S3_BUCKET: test-bucket
+
+  # ── Job 2: Build and push Docker images ────────────────────────────────────
+  # This job only runs on pushes to main (not on pull requests).
+  # It builds your Docker images and pushes them to AWS ECR.
+  # needs: test means this job only starts if the test job succeeded.
+  build-and-push:
+    name: Build and push Docker images
+    runs-on: ubuntu-latest
+    needs: test
+
+    # if: restricts this job to only run on pushes to main.
+    # On pull requests the test job runs but this job is skipped.
+    # This prevents pushing untested images from feature branches.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 1: configure AWS credentials on the runner.
+      # aws-actions/configure-aws-credentials sets up the AWS CLI
+      # and boto3 to use your secrets automatically.
+      # After this step, any aws CLI command works without extra config.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_DEFAULT_REGION }}
+
+      # Step 2: log into AWS ECR.
+      # ECR is a private Docker registry — you must authenticate before
+      # pushing or pulling images. This action handles the login automatically.
+      # The output.registry variable gives us the ECR hostname for later steps.
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Step 3: build the producer image and push it to ECR.
+      # We tag the image with two tags:
+      # - latest: always points to the most recent build
+      # - the git commit SHA: a permanent tag for this exact version
+      #   so you can roll back to any previous commit if needed
+      - name: Build and push producer image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -f docker/Dockerfile.producer \
+            -t $REGISTRY/$ECR_PRODUCER:latest \
+            -t $REGISTRY/$ECR_PRODUCER:$IMAGE_TAG \
+            .
+          docker push $REGISTRY/$ECR_PRODUCER:latest
+          docker push $REGISTRY/$ECR_PRODUCER:$IMAGE_TAG
+          echo "Producer image pushed: $REGISTRY/$ECR_PRODUCER:$IMAGE_TAG"
+
+      # Step 4: build the consumer image and push it to ECR.
+      # Same two-tag approach as the producer.
+      - name: Build and push consumer image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -f docker/Dockerfile.consumer \
+            -t $REGISTRY/$ECR_CONSUMER:latest \
+            -t $REGISTRY/$ECR_CONSUMER:$IMAGE_TAG \
+            .
+          docker push $REGISTRY/$ECR_CONSUMER:latest
+          docker push $REGISTRY/$ECR_CONSUMER:$IMAGE_TAG
+          echo "Consumer image pushed: $REGISTRY/$ECR_CONSUMER:$IMAGE_TAG"
+
+      # Step 5: post a summary to the GitHub Actions run page.
+      # This makes it easy to see at a glance what was built and where.
+      - name: Post build summary
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | Tag |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| Producer | \`$REGISTRY/$ECR_PRODUCER:$IMAGE_TAG\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Consumer | \`$REGISTRY/$ECR_CONSUMER:$IMAGE_TAG\` |" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,34 @@
+# python:3.11-slim is a minimal Python image.
+# "slim" means it strips out compilers and documentation to keep
+# the image size small. We don't need build tools — just Python.
+FROM python:3.11-slim
+
+# Set the working directory inside the container.
+# All subsequent commands run from /app.
+# This is where our code will live inside the container.
+WORKDIR /app
+
+# Copy requirements first and install them before copying the rest of the code.
+# Docker builds images in layers — each instruction is a layer.
+# By copying requirements first, Docker caches the pip install layer.
+# If you only change source code (not requirements), Docker reuses the
+# cached layer and rebuilds in seconds instead of minutes.
+COPY requirements.txt .
+RUN pip install --no-cache-dir \
+    kafka-python==2.0.2 \
+    websocket-client==1.6.1 \
+    python-dotenv==1.0.0
+
+# Copy the source code into the container.
+# We copy src/ separately from requirements so code changes don't
+# invalidate the pip cache layer above.
+COPY src/ ./src/
+
+# Tell Docker this container produces no network services on specific ports.
+# The producer only makes outbound connections (to Binance and Kafka)
+# so no ports need to be exposed.
+
+# The command that runs when the container starts.
+# python -u means unbuffered output — logs appear immediately in
+# docker compose logs instead of being held in a buffer.
+CMD ["python", "-u", "src/producer/binance_producer.py"]
