@@ -1,1 +1,6 @@
 logs/
+data/
+venv/
+*.csv
+*.zip
+*.dll
