@@ -2,8 +2,6 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY requirements.txt .
-
 RUN pip install --no-cache-dir \
     streamlit==1.32.0 \
     kafka-python==2.0.2 \
@@ -17,7 +15,6 @@ RUN pip install --no-cache-dir \
 
 # copy source
 COPY src/ ./src/
-COPY data/ ./data/
 
 ENV PYTHONPATH=/app/src
 
