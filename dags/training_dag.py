@@ -160,7 +160,7 @@ def fraud_detection_training():
         import sys
         sys.path.insert(0, "/opt/airflow")
 
-        from src.features.feature_engineering import (
+        from features.feature_engineering import (
             download_from_s3,
             extract_time_features,
             drop_high_null_columns,
