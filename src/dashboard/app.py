@@ -22,8 +22,10 @@ Layout:
 import time
 import sys
 import os
+import json
 import logging
 
+import boto3
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -31,9 +33,12 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 from datetime import datetime
 
-# absolute paths that match the container layout
-sys.path.insert(0, "/app/src")
-sys.path.insert(0, "/app")
+# Support both Docker (/app layout) and local dev (repo root layout)
+from pathlib import Path as _Path
+_root = _Path(__file__).resolve().parent.parent.parent   # src/dashboard/ -> project root
+for _p in ["/app", "/app/src", str(_root), str(_root / "src")]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import store
 import kafka_reader
@@ -136,10 +141,8 @@ st.markdown("""
 
 store.init_db()
 
-# start the Kafka background thread once per session
-if "kafka_started" not in st.session_state:
-    kafka_reader.start()
-    st.session_state["kafka_started"] = True
+# start (or restart) the background reader thread
+kafka_reader.start()
 
 REFRESH_INTERVAL = int(os.getenv("DASHBOARD_REFRESH_S", "3"))
 FRAUD_THRESHOLD  = float(os.getenv("FRAUD_THRESHOLD", "0.5"))
@@ -174,8 +177,9 @@ def render_header(status: dict):
     total   = status.get("total", 0)
     last_ts = status.get("last_ts") or "—"
 
+    error   = status.get("error")
     dot_cls = "status-live" if running else "status-off"
-    label   = "LIVE" if running else "OFFLINE"
+    label   = "LIVE" if running else ("ERROR" if error else "OFFLINE")
 
     st.markdown(f"""
     <div style="display:flex; justify-content:space-between; align-items:center;
@@ -192,6 +196,7 @@ def render_header(status: dict):
         <span class="status-dot {dot_cls}"></span>
         <span style="font-family:'Space Mono',monospace; font-size:0.8rem; color:#94a3b8;">
           {label} · {total:,} scored · last {last_ts[:19] if last_ts != '—' else '—'}
+          {f'<br><span style="color:#ef4444;font-size:0.7rem;">{error}</span>' if error else ''}
         </span>
       </div>
     </div>
@@ -370,6 +375,114 @@ def render_score_heatmap(preds: list):
     st.plotly_chart(fig, use_container_width=True)
 
 
+@st.cache_data(ttl=300)
+def fetch_model_info_from_s3() -> dict:
+    """
+    Reads current model metrics and recent retraining history from S3.
+    Cached for 5 minutes so the dashboard doesn't hammer S3 on every rerun.
+    Returns an empty dict if S3 is not configured or the files don't exist yet.
+    """
+    bucket = os.getenv("S3_BUCKET", "")
+    region = os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "us-east-1"))
+    if not bucket:
+        return {}
+    try:
+        s3 = boto3.client("s3", region_name=region)
+
+        current: dict = {}
+        try:
+            obj = s3.get_object(Bucket=bucket, Key="models/current_model_metrics.json")
+            current = json.loads(obj["Body"].read())
+        except Exception:
+            pass
+
+        retraining_events: list[dict] = []
+        try:
+            paginator = s3.get_paginator("list_objects_v2")
+            keys = []
+            for page in paginator.paginate(Bucket=bucket, Prefix="logs/retraining_reports/"):
+                for obj in page.get("Contents", []):
+                    keys.append(obj["Key"])
+            for key in sorted(keys)[-20:]:
+                body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+                retraining_events.append(json.loads(body))
+        except Exception:
+            pass
+
+        return {"current": current, "retraining_events": retraining_events}
+    except Exception:
+        return {}
+
+
+def render_model_performance(stats: dict, model_info: dict):
+    """Renders the model performance panel with AUC, retrain history, and flag pie."""
+    current = model_info.get("current", {})
+    events  = model_info.get("retraining_events", [])
+
+    if current.get("auc"):
+        auc_color = SUCCESS if current["auc"] >= 0.90 else WARNING
+        st.markdown(f"""
+        <div class="metric-card" style="margin-bottom:12px;">
+          <div class="metric-label">Current Model AUC</div>
+          <div class="metric-value" style="color:{auc_color};">{current['auc']:.4f}</div>
+          <div class="metric-label" style="margin-top:4px;">
+            deployed {current.get('deployed_at','')[:10]} &nbsp;·&nbsp;
+            {current.get('job_name','')[:30]}
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    if events:
+        fig = go.Figure()
+        xs = [e.get("completed_at", "")[:16] for e in events]
+        labels = [
+            f"by {e.get('triggered_by','manual')[:20]}"
+            for e in events
+        ]
+        fig.add_trace(go.Scatter(
+            x=xs, y=[1] * len(xs),
+            mode="markers+text",
+            marker=dict(size=12, color=WARNING, symbol="diamond"),
+            text=labels,
+            textposition="top center",
+            textfont=dict(color="#94a3b8", size=9),
+        ))
+        fig.update_layout(
+            **PLOTLY_LAYOUT,
+            title="Retraining Events",
+            height=140,
+            yaxis=dict(visible=False),
+            showlegend=False,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    total   = int(stats.get("total") or 0)
+    flagged = int(stats.get("flagged") or 0)
+    legit   = total - flagged
+    if total:
+        fig = go.Figure(go.Pie(
+            labels=["Legitimate", "Flagged Fraud"],
+            values=[legit, flagged],
+            hole=0.65,
+            marker=dict(colors=[ACCENT, DANGER]),
+            textinfo="percent+label",
+            textfont=dict(color="#e2e8f0"),
+        ))
+        fig.update_layout(
+            **PLOTLY_LAYOUT,
+            height=220,
+            showlegend=False,
+            annotations=[dict(
+                text=f"{flagged/total*100:.1f}%<br>fraud",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=16, color=DANGER, family="Space Mono"),
+            )],
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Waiting for data…")
+
+
 def render_alerts_table(alerts: list):
     if not alerts:
         st.success("✅ No fraud alerts yet.")
@@ -408,6 +521,7 @@ def main():
     preds      = store.fetch_recent_predictions(limit=500)
     alerts     = store.fetch_fraud_alerts(limit=20)
     drift_rows = store.fetch_drift_history(limit=200)
+    model_info = fetch_model_info_from_s3()
 
     render_header(status)
     render_kpi_cards(stats, alerts)
@@ -429,32 +543,7 @@ def main():
         render_score_heatmap(preds)
     with col_r2:
         st.markdown('<div class="section-title">Model Performance</div>', unsafe_allow_html=True)
-
-        total   = int(stats.get("total") or 0)
-        flagged = int(stats.get("flagged") or 0)
-        legit   = total - flagged
-        if total:
-            fig = go.Figure(go.Pie(
-                labels=["Legitimate", "Flagged Fraud"],
-                values=[legit, flagged],
-                hole=0.65,
-                marker=dict(colors=[ACCENT, DANGER]),
-                textinfo="percent+label",
-                textfont=dict(color="#e2e8f0"),
-            ))
-            fig.update_layout(
-                **PLOTLY_LAYOUT,
-                height=260,
-                showlegend=False,
-                annotations=[dict(
-                    text=f"{flagged/total*100:.1f}%<br>fraud",
-                    x=0.5, y=0.5, showarrow=False,
-                    font=dict(size=16, color=DANGER, family="Space Mono"),
-                )],
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Waiting for data…")
+        render_model_performance(stats, model_info)
 
     st.markdown('<div class="section-title">Live Fraud Alerts</div>', unsafe_allow_html=True)
     render_alerts_table(alerts)
