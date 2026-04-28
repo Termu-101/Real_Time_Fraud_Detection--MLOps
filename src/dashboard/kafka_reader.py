@@ -218,12 +218,16 @@ def _demo_loop(sm_client, metadata) -> None:
     with _status_lock:
         _status["running"] = True
         _status["mode"]    = "demo"
+        _status["error"]   = None
     trade_id = 1
     try:
         while not _stop_event.is_set():
-            trade = _fake_trade(trade_id)
-            _process_trade(trade, sm_client, metadata)
-            trade_id += 1
+            try:
+                trade = _fake_trade(trade_id)
+                _process_trade(trade, sm_client, metadata)
+                trade_id += 1
+            except Exception as e:
+                log.error(f"Demo trade error (continuing): {e}")
             time.sleep(DEMO_TRADE_INTERVAL)
     finally:
         with _status_lock:
@@ -292,20 +296,26 @@ def _reader_loop():
     except Exception as e:
         log.warning(f"SageMaker client unavailable ({e}) — simulated scores will be used.")
 
+    # Once Kafka is unavailable we stay in demo for all subsequent restarts.
+    use_demo = DEMO_MODE
     while not _stop_event.is_set():
         try:
             store.init_db()
-            if DEMO_MODE:
+            if use_demo:
                 _demo_loop(sm_client, metadata)
             else:
                 _kafka_loop(sm_client, metadata)
+                # _kafka_loop already fell back to demo internally;
+                # keep demo mode on any future restart.
+                use_demo = True
         except Exception as e:
             log.error(f"Reader loop crashed: {e}", exc_info=True)
             with _status_lock:
                 _status["running"] = False
                 _status["error"]   = str(e)
+            use_demo = True   # don't retry Kafka after a crash
             if not _stop_event.is_set():
-                log.info("Restarting reader loop in 5 s…")
+                log.info("Restarting reader in 5 s…")
                 time.sleep(5)
 
 
