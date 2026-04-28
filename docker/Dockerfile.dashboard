@@ -1,0 +1,30 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir \
+    streamlit==1.32.0 \
+    kafka-python==2.0.2 \
+    boto3 \
+    pandas \
+    numpy \
+    plotly \
+    scikit-learn \
+    python-dotenv==1.0.0 \
+    joblib
+
+# copy source
+COPY src/ ./src/
+COPY data/ ./data/
+
+ENV PYTHONPATH=/app/src
+
+EXPOSE 8501
+
+CMD ["streamlit", "run", "src/dashboard/app.py", \
+     "--server.port=8501", \
+     "--server.address=0.0.0.0", \
+     "--server.headless=true", \
+     "--browser.gatherUsageStats=false"]
