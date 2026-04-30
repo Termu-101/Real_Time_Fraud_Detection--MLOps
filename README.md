@@ -1,6 +1,6 @@
 # Real-Time Fraud Detection — MLOps Pipeline
 
-An end-to-end MLOps system that trains an XGBoost fraud detection model on the IEEE-CIS financial dataset, deploys it to AWS SageMaker, and scores live Binance BTC/USDT trades in real time through a Kafka streaming pipeline. A Streamlit dashboard visualises every scored trade, flags fraud instantly, and monitors model health. The system detects data drift daily and automatically retrains and redeploys the model when the model begins to degrade — all without human intervention.
+An end-to-end MLOps system that trains an XGBoost fraud detection model on the IEEE-CIS financial dataset, deploys it to AWS SageMaker, and scores live Binance BTC/USDT trades in real time through a Kafka streaming pipeline. A Streamlit dashboard visualises every scored trade, flags fraud instantly, and monitors model health. The system performs daily drift checks and automatically retrains and redeploys the model when model performance begins to degrade — with minimal human intervention.
 
 ---
 
@@ -26,11 +26,11 @@ An end-to-end MLOps system that trains an XGBoost fraud detection model on the I
 Financial fraud is a real-time problem. By the time a batch fraud check runs hours later, the money is already gone. This project builds a system that:
 
 - **Scores every transaction in under a second** — each trade is evaluated by an ML model the moment it appears in the stream
-- **Monitors itself** — prediction logs are analysed daily for statistical drift; if the fraud-score distribution shifts significantly the model is retrained automatically
+- **Monitors itself** — prediction logs are analysed daily for statistical drift; if the fraud-score distribution shifts significantly, the model is retrained automatically
 - **Retrains without downtime** — new model versions replace old ones using a blue/green swap on SageMaker, so scoring never stops during a retrain
-- **Explains alerts** — every fraud flag includes the top features that drove the high score, making alerts actionable rather than just a number
+- **Approximates alert explanations** — every fraud flag highlights the top features with the largest deviation from their training mean, providing human-readable context rather than just a score
 
-The model is trained on the [IEEE-CIS Fraud Detection dataset](https://www.kaggle.com/competitions/ieee-fraud-detection/data) (590,000 bank card transactions, 3.5% fraud rate). The live scoring target is Binance BTC/USDT trade data, which is mapped onto the same feature space the model was trained on.
+The model is trained on the [IEEE-CIS Fraud Detection dataset](https://www.kaggle.com/competitions/ieee-fraud-detection/data) (590,000 bank card transactions, 3.5% fraud rate). The live scoring target is Binance BTC/USDT trade data. Since live trades do not contain many of the original training features (card details, email domains, device info, etc.), missing features are imputed with the sentinel value -999. This allows the model to operate end-to-end, though predictions should be interpreted as a demonstration of real-time MLOps infrastructure rather than a production-grade fraud detection system.
 
 ---
 
@@ -45,14 +45,14 @@ The IEEE-CIS dataset is downloaded from S3, merged (transaction + identity table
 - Log-transforming `TransactionAmt` (right-skewed distribution)
 - Label-encoding 14 categorical columns (card type, email domain, device type, etc.)
 - Filling remaining nulls with -999 (XGBoost's native missing-value sentinel)
-- StandardScaler normalisation across all numerical features
+- StandardScaler normalisation across numerical features (not required by XGBoost; applied for consistency with drift metrics and feature deviation calculations)
 - Computing `scale_pos_weight` to handle the 3.5% fraud / 96.5% legit class imbalance
 
 All encoder and scaler state is saved to `feature_metadata.json` so live trades can be transformed identically at inference time.
 
 ### Step 2 — Model training (SageMaker)
 
-The processed feature matrix is uploaded to S3 and a SageMaker XGBoost training job is launched. Training uses the built-in XGBoost 1.7-1 container on an `ml.m5.xlarge` instance. The objective is `binary:logistic` and the evaluation metric is AUC. A new model is only promoted to the endpoint if it improves AUC by at least 0.5 percentage points over the current live model.
+The processed feature matrix is uploaded to S3 and a SageMaker XGBoost training job is launched. Training uses the built-in XGBoost 1.7-1 container on an `ml.m5.xlarge` instance. The objective is `binary:logistic` and the evaluation metric is AUC. A new model is only promoted to the endpoint if it improves AUC by at least 0.005 (0.5 percentage points) over the current live model.
 
 ### Step 3 — Live trade ingestion (Binance → Kafka)
 
@@ -67,7 +67,7 @@ The fraud consumer reads from the `transactions` topic and for each trade:
 3. Receives a fraud probability score between 0.0 and 1.0.
 4. Flags the trade as fraud if the score is ≥ 0.5 (configurable).
 5. Logs the trade to an S3 CSV file (flushed every 100 predictions).
-6. When fraud is detected, publishes to the `fraud-alerts` Kafka topic and logs the top 5 features with the highest deviation from their training mean, so the alert explains itself.
+6. When fraud is detected, publishes to the `fraud-alerts` Kafka topic and logs the top 5 features with the highest deviation from their training mean as a lightweight explanation proxy (not SHAP — see note in Components section).
 
 ### Step 5 — Real-time dashboard
 
@@ -82,7 +82,7 @@ The Streamlit dashboard runs a background thread that reads from Kafka and write
 
 ### Step 6 — Daily drift detection
 
-Every day at 06:00 UTC an Airflow DAG reads the last 24 hours of prediction logs from S3 and compares the mean fraud score of that window against the 7-day baseline. If the absolute shift exceeds 0.05 (5 percentage points) the DAG fires a drift alert (saved to S3 as JSON and optionally posted to Slack) and triggers an immediate model retraining run.
+Every day at 06:00 UTC an Airflow DAG reads the last 24 hours of prediction logs from S3 and compares the mean fraud score of that window against the 7-day baseline. This is a lightweight mean-shift heuristic rather than a full distribution test (e.g. KS-test or PSI), intentionally kept simple for operational transparency. If the absolute shift exceeds 0.005 (0.5 percentage points) the DAG fires a drift alert (saved to S3 as JSON and optionally posted to Slack) and triggers an immediate model retraining run.
 
 ### Step 7 — Automatic model retraining (zero downtime)
 
@@ -90,7 +90,7 @@ The retraining DAG launches a new SageMaker training job, polls until it finishe
 
 ### Step 8 — Scheduled weekly full retrain
 
-Separately from drift-triggered retraining, the training DAG runs every Sunday at midnight UTC. It re-downloads raw data from S3, re-runs the full feature engineering pipeline (picking up any new data added during the week), trains a new model, and only deploys it if AUC improves by at least 0.5 percentage points. This prevents model staleness even when no drift is detected.
+Separately from drift-triggered retraining, the training DAG runs every Sunday at midnight UTC. It re-downloads raw data from S3, re-runs the full feature engineering pipeline (picking up any new data added during the week), trains a new model, and only deploys it if AUC improves by at least 0.005 (0.5 percentage points). This prevents model staleness even when no drift is detected.
 
 ---
 
@@ -177,7 +177,7 @@ Separately from drift-triggered retraining, the training DAG runs every Sunday a
 
 ### Binance Producer (`src/producer/binance_producer.py`)
 
-Connects to the Binance US WebSocket stream for the BTC/USDT trading pair. Each trade event arrives in ~10ms and is published directly to the Kafka `transactions` topic. The producer adds a `source: "binance"` field and logs every 100th trade to avoid flooding logs at ~10 trades/second. If the WebSocket drops for any reason (network blip, exchange maintenance), the producer sleeps 5 seconds and reconnects.
+Connects to the Binance US WebSocket stream for the BTC/USDT trading pair. Each trade event typically arrives within milliseconds and is published directly to the Kafka `transactions` topic. The producer adds a `source: "binance"` field and logs every 100th trade to avoid flooding logs at ~10 trades/second. If the WebSocket drops for any reason (network blip, exchange maintenance), the producer sleeps 5 seconds and reconnects.
 
 **Kafka producer settings:**
 - Request timeout: 5000 ms
@@ -194,7 +194,7 @@ For each trade it:
 3. If `fraud_score ≥ FRAUD_THRESHOLD` publishes to `fraud-alerts` and logs the top 5 deviating features
 4. Appends the result to an in-memory batch; when the batch hits 100 entries it is flushed to S3
 
-**Top deviating features** are computed by sorting the scaled feature values by absolute magnitude — features that deviate furthest from zero (their training mean after StandardScaler) are the most unusual for that trade. This gives human-readable alert context like `TransactionAmt=+4.2σ, hour_of_day=+3.1σ`.
+**Top deviating features** are computed by sorting the scaled feature values by absolute magnitude — features that deviate furthest from zero (their training mean after StandardScaler) are the most unusual for that trade. This gives human-readable alert context like `TransactionAmt=+4.2σ, hour_of_day=+3.1σ`. Note: this is a deviation-based proxy, not a model-native explanation method like SHAP. It highlights unusually-valued features for that trade, not necessarily the features the model weighted most heavily.
 
 ### Feature Engineering (`features/feature_engineering.py` + `features/binance_mapper.py`)
 
@@ -260,6 +260,29 @@ A thin wrapper around SQLite that handles all dashboard persistence. Uses a thre
 | Class imbalance handling | scale\_pos\_weight (≈ 27× — ratio of legit to fraud) |
 | Missing value sentinel | -999 (handled natively by XGBoost) |
 | Infrastructure | AWS SageMaker built-in XGBoost 1.7-1, ml.m5.xlarge |
+
+### Evaluated Performance
+
+Metrics measured by scoring the held-out 20% test set (118,108 rows, 4,133 fraud cases) through the live SageMaker endpoint:
+
+| Metric | Value |
+|---|---|
+| Test ROC-AUC | **0.9608** |
+| Train ROC-AUC | 0.9619 |
+| Train / test AUC gap | 0.0011 (minimal overfitting) |
+| Test set size | 118,108 rows (stratified 80/20 split, `random_state=42`) |
+| Fraud cases in test set | 4,133 (3.50%) |
+
+Threshold analysis on the test set:
+
+| Threshold | Precision | Recall | F1 | Fraud caught | Fraud missed |
+|---|---|---|---|---|---|
+| 0.3 | 0.143 | 0.943 | 0.249 | 3,897 / 4,133 | 236 |
+| 0.4 | 0.202 | 0.902 | 0.330 | 3,728 / 4,133 | 405 |
+| **0.5 (default)** | **0.275** | **0.863** | **0.417** | **3,566 / 4,133** | **567** |
+| 0.6 | 0.371 | 0.816 | 0.510 | 3,372 / 4,133 | 761 |
+
+At the default threshold of 0.5 the model catches 86.3% of fraud cases. Raising the threshold reduces false positives at the cost of missing more fraud.
 
 ### Why XGBoost
 
@@ -449,7 +472,7 @@ The Streamlit dashboard at port 8501 is the primary monitoring interface. It req
 | **KPI cards** | Total trades, fraud alerts, flag rate, average fraud score, average BTC price |
 | **Transaction volume** | Bar chart of trade count per 5-second bucket, red overlay for flagged trades, line for average score |
 | **Score distribution** | Histogram of fraud scores for legit (blue) vs. flagged (red) trades with threshold line |
-| **Drift monitor** | Line chart of drift score over time, shaded danger zone above 1.0 |
+| **Drift monitor** | Line chart of drift score over time, shaded danger zone above 1.0 (normalised display scale; threshold logic uses 0.005 absolute mean-score shift) |
 | **Score heatmap** | 2D heatmap — rows are 10-second slots within a minute, columns are minutes — shows score intensity over time |
 | **Model performance** | Current model AUC from S3, retraining event timeline, fraud/legit pie chart |
 | **Live fraud alerts** | Most recent fraud-flagged trades with score bar, price, quantity, and timestamp |
